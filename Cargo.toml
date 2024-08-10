@@ -1,0 +1,9 @@
+[package]
+name = "rusman"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "2.33"
+nix = "0.23" # for chroot and namespaces
+libc = "0.2"

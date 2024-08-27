@@ -1,133 +1,84 @@
-extern crate clap;
-extern crate libc;
-extern crate nix;
+use core::slice;
+use std::{ffi::CString, process};
 
-use clap::{App, Arg, SubCommand};
-use nix::mount::{mount, MsFlags};
-use nix::sched::{unshare, CloneFlags};
-use nix::sys::wait::waitpid;
-use nix::unistd::{execvp, fork, ForkResult};
-use std::ffi::CString;
-use std::fs;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use nix::{
+    sched::{clone, CloneFlags},
+    sys::signal::{self, Signal},
+    unistd::execvp,
+};
+use rusman::container_runtime::namespaces::{
+    mount::mount_namespace, network::network_namespace, pid::pid_namespace,
+};
 
 fn main() {
-    let matches = App::new("Simple Container CLI")
-        .subcommand(
-            SubCommand::with_name("run")
-                .about("Runs a command in an isolated container")
-                .arg(Arg::with_name("COMMAND").required(true).index(1))
-                .arg(Arg::with_name("ARGS").multiple(true).index(2)),
-        )
-        .subcommand(
-            SubCommand::with_name("deploy")
-                .about("Deploys a file or directory to the container root")
-                .arg(Arg::with_name("PATH").required(true).index(1)),
-        )
-        .get_matches();
+    // Define the stack size for the child process
+    let stack_size = 1024 * 1024; // 1MB stack size for the child process
 
-    if let Some(matches) = matches.subcommand_matches("run") {
-        let cmd = matches.value_of("COMMAND").unwrap();
-        let args: Vec<&str> = matches.values_of("ARGS").unwrap_or_default().collect();
-        unsafe { run_container(cmd, args) }
-    } else if let Some(matches) = matches.subcommand_matches("deploy") {
-        let path = matches.value_of("PATH").unwrap();
-        deploy_container(path)
-    }
-}
+    // Alocate memory for the child process
+    let mut child_stack = vec![0; stack_size];
 
-fn deploy_container(path: &str) {
-    let new_root = Path::new("newroot/bin");
+    // Define the flags for the close system call
+    let flags = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
 
-    std::fs::create_dir_all(&new_root).expect("Failed to create new root direcitory");
+    // Execute the clone system call to create a new process
+    match unsafe {
+        // Obtain a mutable pointer to the child stack
+        let child_stack_ptr = child_stack.as_mut_ptr();
 
-    let deploy_path = new_root.join(Path::new(path).file_name().unwrap());
+        // Create a slice from the child stack pointer and the stack size
+        let child_stack_slice = slice::from_raw_parts_mut(child_stack_ptr, stack_size);
 
-    std::fs::copy(path, &deploy_path).expect("Failed to copy");
-
-    println!("Deployed to {:?}", deploy_path);
-}
-
-unsafe fn run_container(cmd: &str, args: Vec<&str>) {
-    match fork() {
-        Ok(ForkResult::Parent { child, .. }) => {
-            //Parent process waits for the child to finish
-            waitpid(child, None).expect("Failed to wait on child");
-        }
-        Ok(ForkResult::Child) => {
-            // Convert Rust strings to C-style strings for execvp
-            let c_cmd = CString::new(cmd).expect("Failed to convert to CString");
-            let c_args: Vec<CString> = args
-                .iter()
-                .map(|arg| CString::new(*arg).expect("Failed to convert to CString"))
-                .collect();
-            let c_args_refs: Vec<&std::ffi::CStr> = c_args.iter().map(AsRef::as_ref).collect();
-
-            //Unshare namespaces
-            unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS).expect("Failed to unshare");
-
-            // Setup the new filesystem root
-            let current_dir = std::env::current_dir().unwrap();
-            setup_rootfs(&format!("{}/newroot", current_dir.display()));
-
-            execvp(&c_cmd, &c_args_refs).expect("Failed to execvp");
-        }
-        Err(err) => eprintln!("Fork failed: {}", err),
-    }
-}
-
-fn setup_rootfs(new_root: &str) {
-    // Change the current directory to the new root
-    std::env::set_current_dir(new_root).expect("Failed to change directory to new root");
-
-    // Convert Rust string to C-style string for chroot
-    let new_root_c = CString::new(new_root).expect("Failed to convert to CStringt");
-
-    // Now, use chroot to change root directory
-    unsafe {
-        if libc::chroot(new_root_c.as_ptr()) != 0 {
-            panic!("chroot failed: {}", std::io::Error::last_os_error());
-        }
-    }
-
-    // Change directory again after chroot to ensure we're at the root
-    std::env::set_current_dir("/").expect("Failed to change directory after chroot");
-
-    // Ensure /proc exists in the new root
-    fs::create_dir_all("/proc").expect("Failed to create /proc directory");
-
-    //Mount the /proc filesystem
-
-    if !is_proc_mounted() {
-        // New, mount the /proc filesystem
-
-        mount(
-            Some("proc"),
-            "/proc",
-            Some("proc"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-            None::<&str>,
-        )
-        .expect("Failed to mount /proc");
-    }
-}
-
-fn is_proc_mounted() -> bool {
-    let file = match File::open("/proc/mounts") {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        if let Ok(l) = line {
-            let parts: Vec<&str> = l.split_whitespace().collect();
-            if parts.len() > 1 && parts[1] == "/proc" {
-                return true;
+        // Call the clone system call with the chile function, child stack, flags, and None for the closure argument
+        clone(Box::new(child_function), child_stack_slice, flags, None)
+    } {
+        /*
+        On success, the PID of the child process is returned in the
+        parent, and 0 is returned in the child.  On failure, -1 is
+        returned in the parent, no child process is created, and errno is
+        set to indicate the error.
+        https://man7.org/linux/man-pages/man2/fork.2.html
+        and
+        https://man7.org/linux/man-pages/man2/clone.2.html
+        */
+        // According to up document comment 0 pid means that we are in parent proccess
+        Ok(child_pid) => {
+            // Check if we are in the parent or child process
+            if child_pid == nix::unistd::Pid::from_raw(0) {
+                // Parent Process
+                // Wait for the child process to terminate
+                match nix::sys::wait::waitpid(child_pid, None) {
+                    Ok(_) => println!("Child process terminated"),
+                    Err(err) => eprintln!("Faild wait for child process: {:?}", err),
+                }
+            } else {
+                // Child process
+                unsafe {
+                    nix::sys::signal::signal(Signal::SIGCHLD, signal::SigHandler::SigIgn)
+                        .expect("Faild to set SIGHLD handler");
+                }
             }
         }
+        Err(err) => {
+            eprintln!("Faild to create new proccess: {:?}", err)
+        }
     }
-    false
+}
+
+/// Function to be executed in the child process.
+/// When this function returns, the child process terminates.
+fn child_function() -> isize {
+    network_namespace();
+    pid_namespace();
+    mount_namespace();
+
+    // Execute an interactive shell within the namespace
+    let program = CString::new("/bin/sh").unwrap();
+    let args = [CString::new("/bin/sh").unwrap()];
+    execvp(&program, &args).expect("Faild to execute program");
+
+    // The execvp call replaces the cureent process,so this line should not reached.
+    println!("Execvp failed!");
+
+    // Exit the child process
+    process::exit(1)
 }
